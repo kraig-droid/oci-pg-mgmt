@@ -1,0 +1,97 @@
+# export ANSIBLE_STDOUT_CALLBACK=debug before running this makes the output nicer
+# ansible-playbook playbook.yaml -e instance_name=p1 -e action=create
+- hosts: localhost
+  vars:
+    tf_desired_state: "{{ (action == 'destroy') | ternary('absent', 'present') }}"
+
+  tasks:
+    - name: Check variables
+      ansible.builtin.assert:
+        that:
+          - action == "create" or action == "destroy"
+
+    - name: Block to check if we previously created instance_name and it still exists
+      block:
+        - name: Read terraform's tfstate
+          ansible.builtin.include_vars: tf/terraform.tfstate
+
+        - name: Ensure we have a valid instance to destroy
+          block:
+            - name: Get a list of display names
+              ansible.builtin.set_fact:
+                display_names: "{{ resources[1]['instances'] | map(attribute='attributes') | map(attribute='display_name') }}"
+
+            - name: See if instance_name matches a display_name
+              ansible.builtin.assert:
+                that:
+                  - "{{ instance_name in display_names }}"
+                fail_msg: "Can't destroy '{{ instance_name }}'. I only know about {{ display_names }}."
+      when: action == "destroy"
+
+    - name: Use the template to make the TF instance file
+      ansible.builtin.template:
+        src: tf_instance.j2
+        dest: ./tf/instance.tf
+
+    - name: Use the template to make the TF provider file
+      ansible.builtin.template:
+        src: tf_provider.j2
+        dest: ./tf/provider.tf
+
+    - name: Run terraform to create or destroy the instance for the DB
+      community.general.terraform:
+        project_path: "tf/"
+        state: "{{ tf_desired_state }}"
+
+    - name: Add newly created instance to 'just_created'
+      block:
+        - name: Read terraform's tfstate
+          ansible.builtin.include_vars: tf/terraform.tfstate
+
+        - name: debug
+          debug:
+            msg: "{{ outputs['public-ip-for-compute-instance']['value']}} "
+
+        - name: Add host to group 'just_created'
+          ansible.builtin.add_host:
+            host: "{{ outputs['private-ip-for-compute-instance']['value']}}"
+            groups: just_created
+            
+      when: action == "create"
+
+- hosts: just_created
+  tasks:
+      - name: APT install prerequisites
+        become: true
+        ansible.builtin.apt:
+          update_cache: yes
+          pkg:
+            - curl
+            - ca-certificates
+            - gnupg
+
+      - name: APT updgrade all
+        become: true
+        ansible.builtin.apt:
+          name: "*"
+          state: latest
+        register: t1
+
+      - name: reboot
+        ansible.builtin.reboot:
+
+      - name: Get PostgreSQL repo key
+        become: true
+        ansible.builtin.shell: 
+          cmd: curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null
+
+      - name: Add PostgreSQL APT Repository
+        become: true
+        ansible.builtin.apt_repository:
+          repo: deb http://apt.postgresql.org/pub/repos/apt bullseye-pgdg main
+
+      - name: APT install Postgres 15
+        become: true
+        ansible.builtin.apt:
+          name: postgresql-15
+

@@ -1,0 +1,16 @@
+terraform {
+    required_providers {
+        oci = {
+            source  = "oracle/oci"
+            version = ">= 4.0.0"
+        }
+    }
+}
+
+provider "oci" {
+  tenancy_ocid = "{{ lookup('ansible.builtin.ini', 'tenancy', section='DEFAULT', file='~/.oci/config') }}"
+  user_ocid = "{{ lookup('ansible.builtin.ini', 'user', section='DEFAULT', file='~/.oci/config') }}"
+  private_key_path = "{{ lookup('ansible.builtin.ini', 'key_file', section='DEFAULT', file='~/.oci/config') }}"
+  fingerprint = "{{ lookup('ansible.builtin.ini', 'fingerprint', section='DEFAULT', file='~/.oci/config') }}"
+  region = "{{ lookup('ansible.builtin.ini', 'region', section='DEFAULT', file='~/.oci/config') }}"
+}

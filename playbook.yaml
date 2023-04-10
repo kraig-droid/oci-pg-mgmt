@@ -1,14 +1,11 @@
 # export ANSIBLE_STDOUT_CALLBACK=debug before running this makes the output nicer
-# ansible-playbook playbook.yaml -e instance_name=p1 -e action=create
+# ansible-playbook playbook.yaml -e instance_name=p1 -e desired_state=present
 - hosts: localhost
-  vars:
-    tf_desired_state: "{{ (action == 'destroy') | ternary('absent', 'present') }}"
-
   tasks:
     - name: Check variables
       ansible.builtin.assert:
         that:
-          - action == "create" or action == "destroy"
+          - desired_state == "present" or desired_state == "absent"
 
     - name: Block to check if we previously created instance_name and it still exists
       block:
@@ -26,22 +23,31 @@
                 that:
                   - "{{ instance_name in display_names }}"
                 fail_msg: "Can't destroy '{{ instance_name }}'. I only know about {{ display_names }}."
-      when: action == "destroy"
 
-    - name: Use the template to make the TF instance file
-      ansible.builtin.template:
-        src: tf_instance.j2
-        dest: ./tf/instance.tf
+        - name: Update known_hosts
+          ansible.builtin.known_hosts:
+            name: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+            state: absent
 
-    - name: Use the template to make the TF provider file
-      ansible.builtin.template:
-        src: tf_provider.j2
-        dest: ./tf/provider.tf
+      when: desired_state == "absent"
+
+    # - name: Use the template to make the TF instance file
+    #   ansible.builtin.template:
+    #     src: tf_instance.j2
+    #     dest: ./tf/instance.tf
 
     - name: Run terraform to create or destroy the instance for the DB
       community.general.terraform:
         project_path: "tf/"
-        state: "{{ tf_desired_state }}"
+        state: "{{ desired_state }}"
+      environment:
+        TF_VAR_tenancy_ocid: "{{ lookup('ansible.builtin.ini', 'tenancy', section='DEFAULT', file='~/.oci/config') }}"
+        TF_VAR_user_ocid: "{{ lookup('ansible.builtin.ini', 'user', section='DEFAULT', file='~/.oci/config') }}"
+        TF_VAR_private_key_path: "{{ lookup('ansible.builtin.ini', 'key_file', section='DEFAULT', file='~/.oci/config') }}"
+        TF_VAR_fingerprint: "{{ lookup('ansible.builtin.ini', 'fingerprint', section='DEFAULT', file='~/.oci/config') }}"
+        TF_VAR_region: "{{ lookup('ansible.builtin.ini', 'region', section='DEFAULT', file='~/.oci/config') }}"
+        TF_VAR_instance_name: "{{ instance_name }}"
+        TF_VAR_desired_state: "{{ desired_state }}"
 
     - name: Add newly created instance to 'just_created'
       block:
@@ -50,14 +56,60 @@
 
         - name: debug
           debug:
-            msg: "{{ outputs['public-ip-for-compute-instance']['value']}} "
+            msg: "{{ outputs['public-ip-for-compute-instance']['value'] }}"
 
         - name: Add host to group 'just_created'
           ansible.builtin.add_host:
-            host: "{{ outputs['private-ip-for-compute-instance']['value']}}"
+            host: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+            # host: "{{ outputs['public-ip-for-compute-instance']['value'] }}"
             groups: just_created
             
-      when: action == "create"
+        - name: debug
+          debug:
+            msg: "{{ outputs['ssh_key_fingerprint'] }}"
+
+        - name: wait
+          ansible.builtin.wait_for:
+            port: 22
+            host: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+            search_regex: SSH
+            delay: 10
+            timeout: 25
+
+        - name: Scan for SSH host keys.
+          ansible.builtin.command: ssh-keyscan {{ outputs['private-ip-for-compute-instance']['value'] }} 2>/dev/null
+          changed_when: false
+          register: ssh_scan
+
+        - name: debug
+          debug:
+            var: ssh_scan
+
+        - name: Update known_hosts.
+          ansible.builtin.known_hosts:
+            key: "{{ item }}"
+            name: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+          with_items: "{{ ssh_scan.stdout_lines }}"
+
+        # - name: Ensure ssh host key is known
+        #   ansible.builtin.known_hosts:
+        #     state: present
+        #     name: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+        #     key: "{{ lookup('pipe', 'ssh-keyscan -trsa ' + outputs['private-ip-for-compute-instance']['value']) }}"
+            
+        # - name: Ensure ssh host key is known
+        #   ansible.builtin.lineinfile:
+        #     dest: ~/.ssh/known_hosts
+        #     create: yes
+        #     state: present
+        #     line: "{{ lookup('pipe', 'ssh-keyscan -trsa ' + outputs['private-ip-for-compute-instance']['value']) }}"
+            
+        # - name: Update known_hosts
+        #   ansible.builtin.known_hosts:
+        #     name: "{{ outputs['private-ip-for-compute-instance']['value'] }}"
+        #     key: "{{ outputs['ssh_key_fingerprint'] }}"
+
+      when: desired_state == "present"
 
 - hosts: just_created
   tasks:
@@ -78,6 +130,7 @@
         register: t1
 
       - name: reboot
+        become: true
         ansible.builtin.reboot:
 
       - name: Get PostgreSQL repo key
